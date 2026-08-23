@@ -1,0 +1,6 @@
+# 워크플로 실행 중에만 존재하는 코드 저장소 체크아웃
+code/
+.pending-absorbed.json
+node_modules/
+*.log
+.DS_Store

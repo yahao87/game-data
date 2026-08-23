@@ -1,0 +1,333 @@
+# lol 데이터 수집·집계 배치 (게임별 워크플로 — 다른 게임은 collect-<game>.yml로 추가)
+#
+# 코드는 비공개 저장소(yahao87/game-total)에서 읽기 전용으로 체크아웃하고,
+# 커밋은 이 저장소의 lol/ 하위에만 한다.
+#
+# 필요 설정:
+#   Secrets: RIOT_API_KEY, CODE_REPO_TOKEN (game-total Contents Read-only PAT)
+#            REVALIDATE_SECRET(선택)
+#   Variables: COLLECT_ENABLED=true, TRAIN_EVERY_HOURS(선택, 기본 6),
+#              SITE_URL(선택 — 설정 시 {SITE_URL}/api/pending에서 온디맨드 펜딩을
+#              읽어 원장에 흡수하고, 배치 후 캐시 무효화도 이 주소로 보낸다)
+#
+# 전체 재집계는 여기 없다 — rebuild-lol.yml을 Actions 탭에서 단건 실행한다.
+# (변수로 켜는 방식은 "켠 채로 남는다"는 문제가 구조적이라 폐기했다. 이력은 그 파일 주석 참고)
+name: collect-lol
+
+on:
+  # 워크플로 파일 수정 푸시 시 즉시 실행 (수정 직후 바로 검증)
+  push:
+    paths:
+      - ".github/workflows/collect-lol.yml"
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      max_matches:
+        description: "라운드당 수집할 최대 경기 수"
+        default: "800"
+      rounds:
+        description: "이번 실행에서 반복할 [수집→집계→커밋] 라운드 수"
+        default: "4"
+      platform:
+        description: "플랫폼 (kr, na1, euw1 ...)"
+        default: "kr"
+      with_timeline:
+        description: "타임라인도 수집 (1=켬). 경기당 API 호출 2배 + 경기당 ~30KB 추가 저장"
+        default: "0"
+
+# 겹침 방지 — 수집 체크포인트·집계 커서·git push가 절대 경쟁하지 않도록 직렬화.
+# lol/ 트리에 커밋하는 워크플로는 전부 같은 그룹(lol-data)이다.
+concurrency:
+  group: lol-data
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    if: ${{ vars.COLLECT_ENABLED == 'true' }}
+    permissions:
+      contents: write
+      # 키 만료 알림 이슈 열기/닫기
+      issues: write
+    steps:
+      # 데이터 저장소 (자기 자신 — 커밋 대상)
+      - uses: actions/checkout@v5
+      # CODE_REPO_TOKEN 사전점검 — 실패 원인을 명확히 출력
+      - name: Preflight — CODE_REPO_TOKEN 점검
+        env:
+          CODE_REPO_TOKEN: ${{ secrets.CODE_REPO_TOKEN }}
+        run: |
+          if [ -z "$CODE_REPO_TOKEN" ]; then
+            echo "::error::CODE_REPO_TOKEN 시크릿이 비어 있습니다. game-data → Settings → Secrets and variables → Actions 에 fine-grained PAT를 등록하세요."
+            exit 1
+          fi
+          status=$(curl -s -o /tmp/preflight.json -w "%{http_code}" \
+            -H "Authorization: Bearer $CODE_REPO_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/yahao87/game-total)
+          if [ "$status" != "200" ]; then
+            echo "::error::CODE_REPO_TOKEN으로 yahao87/game-total 조회 실패 (HTTP $status). 토큰 설정 확인: ① Fine-grained PAT ② Repository access = Only select repositories → yahao87/game-total 선택 ③ Permissions → Contents: Read-only ④ 만료 여부. 수정 후 시크릿을 새 값으로 저장하고 재실행하세요."
+            cat /tmp/preflight.json || true
+            exit 1
+          fi
+          echo "OK — CODE_REPO_TOKEN이 yahao87/game-total에 접근 가능"
+      # 비공개 코드 저장소 (읽기 전용)
+      - uses: actions/checkout@v5
+        with:
+          repository: yahao87/game-total
+          token: ${{ secrets.CODE_REPO_TOKEN }}
+          path: code
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: code/package.json
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: code/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+        working-directory: code
+
+      # 온디맨드 갱신(초단위 경로)으로 서빙 인스턴스에 쌓인 펜딩을 HTTP로 읽어 원장에 흡수.
+      # 읽기 전용이다 — 삭제는 인스턴스의 자가 청소가 matchindex를 보고 알아서 한다.
+      # 인스턴스가 죽어 있으면 조용히 건너뛴다(fail-open) — 사이트가 죽은 상황이면
+      # 새 펜딩도 안 쌓이므로 다음 라운드가 흡수하면 된다.
+      - name: Absorb pending (on-demand refreshes)
+        working-directory: code
+        env:
+          LOL_PENDING_URL: ${{ vars.SITE_URL && format('{0}/api/pending', vars.SITE_URL) || '' }}
+          PLATFORM: ${{ inputs.platform || 'kr' }}
+          DATA_DIR: ${{ github.workspace }}/lol/collected
+        run: pnpm --filter @game-total/lol exec tsx scripts/absorb-pending.ts
+
+      # [수집 → 집계 → 커밋]을 라운드로 반복 — 크롤은 레이트리밋 한도에서 연속으로 돌고,
+      # 데이터는 라운드마다(~20분 간격) 커밋되어 사이트에 계속 반영된다.
+      # cron 주기는 "재시동 신호"일 뿐: concurrency 직렬화 + 큐잉으로 사실상 24시간 연속 크롤.
+      - name: Collect rounds (collect → aggregate → commit)
+        working-directory: code
+        env:
+          RIOT_API_KEY: ${{ secrets.RIOT_API_KEY }}
+          PLATFORM: ${{ inputs.platform || 'kr' }}
+          MAX_MATCHES: ${{ inputs.max_matches || '800' }}
+          ROUNDS: ${{ inputs.rounds || '4' }}
+          MAX_PLAYERS: "2000"
+          # 기본 off: 켜면 수집 속도가 절반이 되고 저장 용량이 급증한다.
+          # 끈 상태에서도 사이트는 조회 시점에 Riot API로 타임라인을 받아 영구 캐시하므로
+          # 사용자가 실제로 여는 경기의 빌드 순서·킬 지도는 실데이터로 나온다.
+          WITH_TIMELINE: ${{ inputs.with_timeline || '0' }}
+          DATA_DIR: ${{ github.workspace }}/lol/collected
+          AGG_DIR: ${{ github.workspace }}/lol/aggregated
+          # 수집기가 API 키 인증 실패(401/403 연속 — 개발 키 만료)로 멈추면 이 파일을 쓴다.
+          # 죽은 키로 남은 라운드를 돌려 봐야 레이트리밋 속도로 실패만 반복하므로,
+          # 마커를 본 라운드 루프는 진행분 정리까지만 하고 끝낸다.
+          COLLECT_STOP_FILE: ${{ runner.temp }}/collect-auth-stop
+        run: |
+          set -u
+          W="$GITHUB_WORKSPACE"
+          git -C "$W" config user.name "collect-bot"
+          git -C "$W" config user.email "actions@github.com"
+          # 원장(.ndjson)은 .gitattributes의 union 병합으로 양쪽 줄이 모두 살아남는다.
+          git -C "$W" config merge.union.name "append-only union"
+
+          # 경합 해소: 원장은 union으로 합치고, 파생 산출물은 들어온 스냅샷을 채택한 뒤
+          # 재집계로 우리 신규 경기를 다시 얹는다. 어느 쪽 데이터도 버리지 않는 순서다.
+          sync_with_remote() {
+            git -C "$W" fetch origin "$GITHUB_REF_NAME"
+            # -X theirs 는 '파생 산출물은 원격 스냅샷 채택'을 뜻한다. 원장(.ndjson)은
+            # .gitattributes의 union 병합이 우선하므로 양쪽 경기가 모두 남는다.
+            # 이 조합이면 충돌 0으로 자동 해소되고, 이후 재집계로 우리 신규 경기를 다시 얹는다.
+            if ! git -C "$W" merge --no-edit -X theirs "origin/$GITHUB_REF_NAME"; then
+              echo "::warning::자동 병합 실패 — 병합을 중단하고 이번 라운드는 다음 실행에 맡긴다"
+              git -C "$W" merge --abort || true
+              return 1
+            fi
+            pnpm --filter @game-total/lol aggregate
+            git -C "$W" add lol/
+            git -C "$W" diff --cached --quiet || \
+              git -C "$W" commit -m "lol: 경합 해소 후 재집계 $(date -u +%Y-%m-%dT%H:%M)"
+          }
+
+          push_with_retry() {
+            for attempt in 1 2 3 4 5; do
+              if git -C "$W" push; then return 0; fi
+              echo "푸시 경합 — 재동기화 후 재시도 ($attempt/5)"
+              sync_with_remote || return 1
+              sleep $((attempt * 3))
+            done
+            echo "::warning::푸시를 5회 시도했지만 실패했다. 이번 라운드 결과는 다음 실행이 체크포인트에서 다시 수집한다."
+            return 1
+          }
+
+          warn_auth_stop() {
+            echo "::warning::Riot API 키 인증 실패(개발 키 만료 가능성) — 이번 라운드 진행분은 정리했고 남은 라운드는 건너뛴다. RIOT_API_KEY 시크릿을 갱신하면 다음 배치가 체크포인트에서 자동으로 이어간다."
+          }
+
+          rm -f "$COLLECT_STOP_FILE"
+          for i in $(seq 1 "$ROUNDS"); do
+            echo "── 라운드 $i/$ROUNDS ──"
+            pnpm --filter @game-total/lol collect
+            pnpm --filter @game-total/lol aggregate
+            git -C "$W" add lol/
+            if git -C "$W" diff --cached --quiet; then
+              [ -f "$COLLECT_STOP_FILE" ] && warn_auth_stop
+              echo "변경 없음 — 라운드 종료"
+              break
+            fi
+            git -C "$W" commit -m "lol: 자동 수집 r$i $(date -u +%Y-%m-%dT%H:%M)"
+            push_with_retry || break
+            # 키가 죽었으면 진행분 정리(위의 집계·커밋·푸시)까지만 하고 멈춘다
+            if [ -f "$COLLECT_STOP_FILE" ]; then
+              warn_auth_stop
+              break
+            fi
+          done
+
+      # 키 만료를 이슈로 알린다 — 개발 키 재발급은 포털의 reCAPTCHA 뒤에 있어서
+      # 자동화할 수 없으므로(우회는 정책 위반), 자동화 가능한 최대치는 "빨리 알리고
+      # 갱신 후 뒷정리를 없애는 것"이다. 이슈가 곧 상태판: 열림 = 키 죽음, 닫힘 = 정상.
+      #   · 서킷브레이커가 멈춘 실행 → collect-key 이슈 열기 (이미 열려 있으면 그대로 —
+      #     15분 주기 탐침이 이슈 스팸이 되지 않게 라벨로 중복을 막는다)
+      #   · 키 갱신 후 첫 정상 수집 → 그 이슈를 자동으로 닫는다
+      # 이 스텝은 앞 스텝들이 성공했을 때만 돈다 — 체크아웃 실패 같은 무관한 문제로
+      # 멀쩡한 이슈를 닫아 버리지 않기 위해서다.
+      - name: Notify key expiry (이슈 열기/닫기)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COLLECT_STOP_FILE: ${{ runner.temp }}/collect-auth-stop
+        run: |
+          set -u
+          open=$(gh issue list --repo "$GITHUB_REPOSITORY" --label collect-key --state open \
+            --json number --jq '.[0].number // empty' 2>/dev/null || echo "")
+          if [ -f "$COLLECT_STOP_FILE" ]; then
+            if [ -z "$open" ]; then
+              gh label create collect-key --repo "$GITHUB_REPOSITORY" \
+                --color D93F0B --description "수집 API 키 상태 추적" 2>/dev/null || true
+              body="$RUNNER_TEMP/key-issue-body.md"
+              {
+                echo "자동 수집이 인증 실패(401/403 연속)로 멈췄다 — 개발 키 만료로 보인다."
+                echo
+                echo "1. https://developer.riotgames.com 에서 키 재발급 (REGENERATE API KEY)"
+                echo "2. 이 저장소 Settings → Secrets and variables → Actions → \`RIOT_API_KEY\` 값 갱신"
+                echo
+                echo "그러면 다음 배치(15분 주기)가 체크포인트에서 자동으로 이어가고, 이 이슈도 자동으로 닫힌다."
+                echo "갱신 전까지 배치는 몇 초짜리 탐침으로만 돌아 액션 시간을 거의 쓰지 않는다."
+              } > "$body"
+              gh issue create --repo "$GITHUB_REPOSITORY" --label collect-key \
+                --title "수집 API 키 갱신 필요" --body-file "$body" \
+                || echo "::warning::이슈 생성 실패 — 알림 없이 계속"
+            else
+              echo "키 만료 이슈 #$open 이미 열려 있음 — 중복 생성 안 함"
+            fi
+          elif [ -n "$open" ]; then
+            gh issue close "$open" --repo "$GITHUB_REPOSITORY" \
+              --comment "키 갱신 확인 — 수집이 체크포인트에서 자동 재개됐다." \
+              || echo "::warning::이슈 닫기 실패 — 다음 실행에서 재시도"
+          fi
+
+      # 모델 학습은 이 job 안에서 돈다.
+      #
+      # 예전에는 train-lol.yml이라는 별도 워크플로였는데, 같은 concurrency 그룹에서
+      # 이 수집 job에 계속 밀렸다. 수집은 15분 cron인데 1회 실행이 4라운드(~2시간)라
+      # 그룹을 사실상 상시 점유하고, GitHub는 그룹당 대기 슬롯을 1개만 유지하므로
+      # 대기 중이던 학습은 다음 수집이 큐에 들어오는 순간 취소됐다 —
+      # 16회 예약 중 성공 3회, 모델 팩이 이틀씩 낡았다.
+      #
+      # 같은 job 안에 두면 경쟁 자체가 없다. 매번 돌 필요는 없으므로 팩이
+      # TRAIN_EVERY_HOURS(기본 6)보다 낡았을 때만 돈다. 나이는 git 이력이 아니라
+      # 팩 안의 generatedAt을 본다 — 체크아웃이 얕아서 git log가 모를 수 있다.
+      #
+      # 수집은 이미 커밋·푸시를 마친 뒤라, 학습 실패로 실행 전체를 빨갛게 만들지 않는다.
+      # 키 만료로 수집이 일찍 멈춘 실행에서도 학습은 그대로 돈다 — 학습은 로컬 원장만
+      # 읽고 Riot API를 부르지 않으므로, 이미 커밋된 데이터로 팩을 최신화하는 게 맞다.
+      - name: Train models (팩이 낡았을 때만)
+        working-directory: code
+        continue-on-error: true
+        env:
+          PLATFORM: ${{ inputs.platform || 'kr' }}
+          TRAIN_MAX_MATCHES: "200000"
+          DRAFT_MAX_MATCHES: "200000"
+          EVERY_HOURS: ${{ vars.TRAIN_EVERY_HOURS || '6' }}
+          DATA_DIR: ${{ github.workspace }}/lol/collected
+          AGG_DIR: ${{ github.workspace }}/lol/aggregated
+          NODE_OPTIONS: --max-old-space-size=6144
+        run: |
+          set -eu
+          W="$GITHUB_WORKSPACE"
+          MODELS="$W/lol/aggregated/$PLATFORM/models"
+
+          # 팩 나이(시간)를 팩 안의 generatedAt에서 읽는다. 없거나 못 읽으면 아주 낡은 걸로 본다.
+          pack_age() {
+            [ -f "$1" ] || { echo 999999; return; }
+            node -e '
+              const fs = require("fs");
+              try {
+                const g = JSON.parse(fs.readFileSync(process.argv[1], "utf8")).generatedAt;
+                const h = Math.floor((Date.now() - Date.parse(g)) / 3600000);
+                console.log(Number.isFinite(h) && h >= 0 ? h : 999999);
+              } catch { console.log(999999); }
+            ' "$1"
+          }
+
+          # 두 학습은 표본 정의가 달라 서로 다른 스크립트다.
+          #   train.ts       10명 전원의 이력이 필요 — 7만 경기가 5천 표본으로 줄어든다
+          #   train-draft.ts 챔피언·라인·결과만 — 같은 원장에서 14만 표본이 나온다
+          # 나이는 각자의 팩으로 따로 잰다. 한쪽이 실패해도 다른 쪽은 갱신돼야 한다.
+          run_if_stale() {
+            NAME="$1"; PACK="$2"; SCRIPT="$3"
+            AGE=$(pack_age "$PACK")
+            if [ "$AGE" -lt "$EVERY_HOURS" ]; then
+              echo "[$NAME] 팩이 ${AGE}시간 전 것 — ${EVERY_HOURS}시간 주기라 건너뛴다"
+              return 0
+            fi
+            echo "[$NAME] 팩 나이 ${AGE}시간 — 재학습한다"
+            # 한쪽 학습이 죽어도 나머지와 커밋 단계는 진행한다
+            pnpm --filter @game-total/lol exec tsx "$SCRIPT" || echo "::warning::[$NAME] 학습 실패 — 다음 주기에 다시 시도"
+          }
+
+          run_if_stale "패밀리" "$MODELS/family-v1.json" scripts/train.ts
+          run_if_stale "밴픽"   "$MODELS/draft-v1.json"  scripts/train-draft.ts
+
+          git -C "$W" add lol/
+          if git -C "$W" diff --cached --quiet; then
+            echo "변경 없음 (전부 건너뛰었거나 표본 부족이거나 동일 산출물)"
+            exit 0
+          fi
+          git -C "$W" commit -m "lol: 모델 학습 $(date -u +%Y-%m-%dT%H:%M)"
+          # 학습 산출물은 models/ 아래만 건드리므로, 경합 시 원격을 우선 채택해 병합해도
+          # 우리 커밋의 models/ 변경은 그대로 남는다.
+          for attempt in 1 2 3 4 5; do
+            if git -C "$W" push; then exit 0; fi
+            echo "푸시 경합 — 병합 후 재시도 ($attempt/5)"
+            git -C "$W" fetch origin "$GITHUB_REF_NAME"
+            git -C "$W" merge --no-edit -X ours "origin/$GITHUB_REF_NAME" || {
+              echo "::warning::자동 병합 실패 — 다음 주기에 다시 시도"
+              git -C "$W" merge --abort || true
+              exit 0
+            }
+            sleep $((attempt * 3))
+          done
+          echo "::warning::학습 산출물 푸시 실패 — 다음 주기에 다시 시도한다"
+
+      # 흡수 마커 정리. HTTP 펜딩(인스턴스)에서는 원격 삭제가 no-op이라 마커만 지우고,
+      # 단일 레포 폴백(LOL_PENDING_DIR)에서는 push 성공 후의 실삭제다 (실패 시 다음
+      # 실행이 다시 흡수 — 유실 없음).
+      - name: Cleanup absorbed pending
+        working-directory: code
+        env:
+          LOL_PENDING_URL: ${{ vars.SITE_URL && format('{0}/api/pending', vars.SITE_URL) || '' }}
+          PLATFORM: ${{ inputs.platform || 'kr' }}
+          DATA_DIR: ${{ github.workspace }}/lol/collected
+        run: pnpm --filter @game-total/lol exec tsx scripts/absorb-pending.ts --cleanup
+
+      # 선택: 사이트 캐시 즉시 무효화 (미설정 시 ISR 주기로 자동 반영)
+      - name: Revalidate site cache (optional)
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
+        run: |
+          if [ -n "$SITE_URL" ] && [ -n "$REVALIDATE_SECRET" ]; then
+            curl -fsS -X POST -H "x-revalidate-secret: $REVALIDATE_SECRET" "$SITE_URL/api/revalidate" || true
+          else
+            echo "REVALIDATE 미설정 — 건너뜀 (ISR 주기로 자동 반영)"
+          fi

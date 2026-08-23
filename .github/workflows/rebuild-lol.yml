@@ -1,0 +1,204 @@
+# 산출물 전체 재집계 — 단건 실행 전용
+#
+# 왜 별도 워크플로인가:
+#   재집계는 "스키마가 바뀌었을 때 한 번" 돌리는 작업이다. 예전에는 저장소 변수
+#   REBUILD_AGG=true로 켜고 수집 워크플로 안에서 돌렸는데, 변수는 켠 채로 남는다.
+#   그래서 매 실행이 몇 시간짜리 재집계가 되어 수집이 멈추는 사고가 났고(2026-08-19),
+#   그걸 막으려고 완료 마커(.rebuilt)를 넣자 이번엔 REBUILD_AGG=true인데도 영원히
+#   건너뛰는 상태가 됐다(마커 == 스탬프). 변수로 "1회성 작업"을 표현하려 한 게 잘못이다.
+#   1회성 작업은 1회 실행으로 표현한다 — Actions 탭에서 Run workflow.
+#
+# 정기 수집을 선점한다(cancel-in-progress). 수집은 체크포인트 기반이라 중간에 끊겨도
+# 다음 실행이 이어서 받고, 원장은 append-only라 유실이 없다.
+#
+# 소요 시간 감: 15만 경기 기준 재집계는 30~60분이다. 몇 분 만에 끝났다면 뭔가
+# 잘못된 것이다 — 그래서 점검 스텝이 산출물의 updatedAt으로 실제 재집계 여부를 검사한다.
+name: rebuild-lol
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "플랫폼. all = 원장에 있는 전부 (권장). 특정 플랫폼만 다시 구울 때만 kr/na1/euw1 등을 적는다"
+        default: "all"
+      prune_history:
+        description: "커밋 이력도 함께 정리 (true/false). 산출물은 원장에서 재생성되므로 잃는 정보가 없다"
+        default: "false"
+
+concurrency:
+  group: lol-data
+  # 단건 실행이 정기 수집보다 우선한다 — 안 그러면 대기열에서 다음 수집에 밀려 취소된다
+  cancel-in-progress: true
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    permissions:
+      contents: write
+    steps:
+      # 이력 정리를 해도 얕은 체크아웃으로 충분하다 — 고아 커밋은 부모가 없어
+      # 과거 객체를 하나도 참조하지 않는다.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+      - name: Preflight — CODE_REPO_TOKEN 점검
+        env:
+          CODE_REPO_TOKEN: ${{ secrets.CODE_REPO_TOKEN }}
+        run: |
+          if [ -z "$CODE_REPO_TOKEN" ]; then
+            echo "::error::CODE_REPO_TOKEN 시크릿이 비어 있습니다."
+            exit 1
+          fi
+          status=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $CODE_REPO_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/yahao87/game-total)
+          if [ "$status" != "200" ]; then
+            echo "::error::CODE_REPO_TOKEN으로 yahao87/game-total 조회 실패 (HTTP $status)."
+            exit 1
+          fi
+      - uses: actions/checkout@v5
+        with:
+          repository: yahao87/game-total
+          token: ${{ secrets.CODE_REPO_TOKEN }}
+          path: code
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: code/package.json
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: code/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+        working-directory: code
+
+      - name: 원장 확인
+        run: |
+          set -eu
+          C="$GITHUB_WORKSPACE/lol/collected"
+          test -d "$C" || { echo "::error::원장이 없다: $C"; exit 1; }
+          for d in "$C"/*/; do
+            p=$(basename "$d")
+            echo "[$p] $(du -sh "$d" | cut -f1) · 매치파일 $(find "$d/matches" -name '*.ndjson' | wc -l)개 · 경기 $(find "$d/matches" -name '*.ndjson' -exec cat {} + | wc -l)줄"
+          done
+
+      # 'all'이면 PLATFORM을 비워둬 집계 CLI가 원장의 모든 플랫폼을 훑게 한다.
+      # ⚠ GitHub 표현식 `x == 'all' && '' || x`는 ''이 falsy라 x로 새는 함정이 있어
+      #   변환을 셸에서 한다 — 실제로 이 함정 때문에 PLATFORM='all'이 그대로 전달돼
+      #   존재하지 않는 플랫폼을 1초 만에 "신규 0경기"로 집계하고 초록색으로 끝난
+      #   사고가 있었다 (2026-08-23). 집계 스크립트도 이제 없는 플랫폼이면 즉사한다.
+      - name: 전체 재집계 (원장 → 산출물)
+        working-directory: code
+        env:
+          PLATFORM_RAW: ${{ inputs.platform }}
+          DATA_DIR: ${{ github.workspace }}/lol/collected
+          AGG_DIR: ${{ github.workspace }}/lol/aggregated
+          NODE_OPTIONS: --max-old-space-size=12288
+        run: |
+          set -eu
+          date -u +%s > "$RUNNER_TEMP/rebuild-start"
+          if [ "$PLATFORM_RAW" != "all" ]; then export PLATFORM="$PLATFORM_RAW"; fi
+          pnpm --filter @game-total/lol aggregate -- --rebuild
+
+      - name: 산출물 점검
+        run: |
+          set -eu
+          A="$GITHUB_WORKSPACE/lol/aggregated"
+          # 폐기된 산출물이 남아 있으면 지운다 (재집계는 자기가 쓰는 파일만 만든다)
+          rm -f "$A/.rebuilt"
+          # 원장 없는 산출물 디렉토리 제거 — 잘못된 PLATFORM 값이 남긴 잔재(all/ 등)
+          for d in "$A"/*/; do
+            p=$(basename "$d")
+            if [ ! -d "$GITHUB_WORKSPACE/lol/collected/$p" ]; then
+              echo "::warning::원장 없는 산출물 디렉토리 제거: $p"
+              rm -rf "$d"
+            fi
+          done
+          for d in "$GITHUB_WORKSPACE"/lol/collected/*/; do
+            p=$(basename "$d")
+            rm -f "$A/$p/leaderboard.json"
+            node -e '
+              const fs = require("fs"), path = require("path");
+              const [a, p, startFile] = process.argv.slice(1);
+              const pop = JSON.parse(fs.readFileSync(path.join(a, "population.json"), "utf8"));
+              console.log(`[${p}] layout:`, JSON.stringify(pop.layout));
+              console.log(`[${p}] 경기 ${pop.totalMatches} · 플레이어 ${pop.totalPlayers} · updatedAt ${pop.updatedAt}`);
+              // 신선도: 이 실행이 시작된 이후에 갱신된 산출물이어야 한다.
+              // (재집계가 조용히 아무것도 안 하고 성공한 2026-08-23 사고의 재발 방지)
+              const started = Number(fs.readFileSync(startFile, "utf8")) * 1000;
+              if (Date.parse(pop.updatedAt) < started) throw new Error("이 실행에서 갱신되지 않았다 — 재집계가 실제로 돌지 않았다");
+              if (!pop.layout.hashVersion) throw new Error("hashVersion이 없다 — 구버전 코드로 구웠다");
+              if (!pop.layout.pairShards) throw new Error("pairShards가 없다 — 페어 분리 이전 코드다");
+              // 샤드가 4,096을 넘으면 하위 디렉토리로 나뉘므로 재귀로 훑는다
+              const sizes = [];
+              const walk = (d) => {
+                for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+                  const q = path.join(d, e.name);
+                  if (e.isDirectory()) walk(q);
+                  else if (e.name.endsWith(".json")) sizes.push(fs.statSync(q).size);
+                }
+              };
+              walk(path.join(a, "profiles"));
+              sizes.sort((x, y) => x - y);
+              const mb = (n) => (n / 1e6).toFixed(2) + "MB";
+              console.log(`[${p}] 프로필 샤드 ${sizes.length}개 · 최대 ${mb(sizes.at(-1))} · 중앙값 ${mb(sizes[sizes.length >> 1])}`);
+              // 옛 배치의 병목은 25.7MB짜리 샤드였다. 5MB를 넘으면 뭔가 잘못된 것이다.
+              if (sizes.at(-1) > 5e6) throw new Error("샤드가 여전히 크다 — 해시/샤드 수를 확인하라");
+            ' "$A/$p" "$p" "$RUNNER_TEMP/rebuild-start"
+          done
+
+      - name: 커밋 · 푸시
+        env:
+          PRUNE: ${{ inputs.prune_history }}
+        run: |
+          set -eu
+          cd "$GITHUB_WORKSPACE"
+          git config user.name "rebuild-bot"
+          git config user.email "actions@github.com"
+          if [ "$PRUNE" = "true" ]; then
+            # 파생 산출물의 이력은 되살릴 정보가 없다 — 원장은 append-only라 HEAD 한 커밋에
+            # 전부 들어 있고, 산출물은 그 원장에서 언제든 다시 굽는다.
+            # 이 시점은 산출물 점검을 통과한 뒤라, 밀기 전에 이미 결과가 좋다는 걸 안다.
+            git checkout --orphan rebuilt
+            git add -A
+            git commit -m "lol: 산출물 전체 재집계 + 이력 정리 $(date -u +%Y-%m-%dT%H:%M)"
+            git branch -D "$GITHUB_REF_NAME"
+            git branch -m "$GITHUB_REF_NAME"
+            git push -f origin "$GITHUB_REF_NAME"
+            echo "::notice::이력 정리 완료 — 원장 + 새 산출물만 남긴 단일 커밋"
+            exit 0
+          fi
+          git add -A
+          if git diff --cached --quiet; then
+            echo "재집계 결과가 기존과 동일하다"
+            exit 0
+          fi
+          git commit -m "lol: 산출물 전체 재집계 $(date -u +%Y-%m-%dT%H:%M)"
+          # 재집계 도중 원격이 전진했을 수 있다. 원장 신규 줄은 union으로 합치고
+          # (-X ours: 산출물은 우리 재집계본 유지) 다시 민다.
+          for attempt in 1 2 3 4 5; do
+            if git push; then exit 0; fi
+            echo "푸시 경합 — 원격 병합 후 재시도 ($attempt/5)"
+            git fetch origin "$GITHUB_REF_NAME"
+            git merge --no-edit -X ours "origin/$GITHUB_REF_NAME" || {
+              git merge --abort || true
+              echo "::error::병합 실패"
+              exit 1
+            }
+            sleep $((attempt * 3))
+          done
+          echo "::error::푸시를 5회 시도했지만 실패했다"
+          exit 1
+
+      - name: 사이트 캐시 무효화 (선택)
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
+        run: |
+          if [ -n "$SITE_URL" ] && [ -n "$REVALIDATE_SECRET" ]; then
+            curl -fsS -X POST -H "x-revalidate-secret: $REVALIDATE_SECRET" "$SITE_URL/api/revalidate" || true
+          else
+            echo "REVALIDATE 미설정 — 건너뜀"
+          fi
