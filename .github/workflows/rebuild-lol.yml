@@ -192,6 +192,88 @@ jobs:
           echo "::error::푸시를 5회 시도했지만 실패했다"
           exit 1
 
+      # 파생 산출물이 git을 떠나면(④-컷오버) 인스턴스는 "git 트리 → pack-sqlite" 부트스트랩
+      # 경로를 잃는다. 그렇다고 1GB RAM 기계에서 재집계를 돌릴 수는 없다(러너는 12GB 힙을 쓴다).
+      # 그래서 여기서 구운 산출물을 SQLite 하나로 눌러 릴리스 자산으로 발행한다 — 인스턴스는
+      # deploy/instance/fetch-agg-snapshot.sh 로 받아서 풀기만 한다.
+      #
+      # 자산이 2GB를 넘으면 GitHub이 거부하므로 gzip 본체를 1.5GB 조각으로 나눠 올리고,
+      # 조각 목록·sha256·레이아웃을 매니페스트(agg-{platform}.json)에 남긴다.
+      - name: SQLite 스냅샷 발행 (agg-latest)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SNAP: ${{ runner.temp }}/snapshot
+        run: |
+          set -eu
+          mkdir -p "$SNAP"
+          A="$GITHUB_WORKSPACE/lol/aggregated"
+          for d in "$A"/*/; do
+            p=$(basename "$d")
+            echo "── [$p] 트리 → DB"
+            # PACK_TXN_ROWS: 나눠 커밋한다. 전체를 한 트랜잭션으로 묶으면 커밋 전까지 WAL이
+            # DB 크기만큼 자라 순간 디스크가 2배로 필요하다 — 러너에서는 그 여유가 없다.
+            # 실패해도 여기서는 처음부터 다시 구우면 그만이라 부분 DB가 문제되지 않는다.
+            ( cd code && AGG_DIR="$A" AGG_SQLITE="$SNAP" PLATFORM="$p" PACK_TXN_ROWS=20000 \
+                pnpm --filter @game-total/lol exec tsx scripts/pack-sqlite.ts )
+            # 바이트 대조 — 스냅샷이 트리와 같은 산출물임을 발행 전에 못 박는다
+            ( cd code && AGG_DIR="$A" AGG_SQLITE="$SNAP" PLATFORM="$p" \
+                pnpm --filter @game-total/lol exec tsx scripts/pack-sqlite.ts --verify )
+
+            db="$SNAP/$p.db"
+            rm -f "$db-wal" "$db-shm"
+            db_bytes=$(stat -c%s "$db")
+            db_sha=$(sha256sum "$db" | cut -d' ' -f1)
+            echo "── [$p] gzip ($((db_bytes / 1000000))MB)"
+            gzip -6 -c "$db" > "$SNAP/$p.db.gz"
+            rm -f "$db"                       # 러너 디스크를 아낀다 — 이 뒤로 DB 원본은 필요 없다
+            gz_bytes=$(stat -c%s "$SNAP/$p.db.gz")
+            gz_sha=$(sha256sum "$SNAP/$p.db.gz" | cut -d' ' -f1)
+            ( cd "$SNAP" && split -b 1500M -d -a 2 "$p.db.gz" "agg-$p.db.gz.part-" && rm -f "$p.db.gz" )
+            parts=$(cd "$SNAP" && ls "agg-$p.db.gz.part-"*)
+            echo "── [$p] gz $((gz_bytes / 1000000))MB · 파트 $(echo "$parts" | wc -l)개"
+
+            node -e '
+              const fs = require("fs");
+              const [snap, agg, p, dbBytes, dbSha, gzBytes, gzSha, partList, commit] = process.argv.slice(1);
+              const pop = JSON.parse(fs.readFileSync(`${agg}/${p}/population.json`, "utf8"));
+              fs.writeFileSync(`${snap}/agg-${p}.json`, JSON.stringify({
+                platform: p,
+                generatedAt: new Date().toISOString(),
+                sourceCommit: commit,
+                aggregateUpdatedAt: pop.updatedAt,
+                layout: pop.layout,
+                totalMatches: pop.totalMatches,
+                totalPlayers: pop.totalPlayers,
+                dbBytes: Number(dbBytes), dbSha256: dbSha,
+                gzBytes: Number(gzBytes), gzSha256: gzSha,
+                parts: partList.split("\n").filter(Boolean),
+              }, null, 2) + "\n");
+            ' "$SNAP" "$A" "$p" "$db_bytes" "$db_sha" "$gz_bytes" "$gz_sha" "$parts" "$GITHUB_SHA"
+
+            if ! gh release view agg-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh release create agg-latest --repo "$GITHUB_REPOSITORY" \
+                --title "집계 산출물 스냅샷 (자동 갱신)" \
+                --notes "rebuild-lol이 갱신하는 고정 릴리스. 인스턴스 부트스트랩·스키마 변경 채택용 SQLite 스냅샷이다." \
+                --latest=false
+            fi
+            # 지난 스냅샷이 더 많은 조각으로 나뉘어 있었다면 남은 조각을 지운다 —
+            # 매니페스트가 참조하지 않는 자산은 혼란만 준다.
+            gh release view agg-latest --repo "$GITHUB_REPOSITORY" --json assets \
+              --jq '.assets[].name' | grep "^agg-$p\.db\.gz\.part-" | while read -r old; do
+                echo "$parts" | grep -qx "$old" || {
+                  echo "낡은 조각 삭제: $old"
+                  gh release delete-asset agg-latest "$old" --repo "$GITHUB_REPOSITORY" --yes || true
+                }
+              done
+            # 매니페스트는 마지막에 올린다 — 조각이 다 올라간 뒤라야 인스턴스가 조립할 수 있다.
+            ( cd "$SNAP" && gh release upload agg-latest $parts --repo "$GITHUB_REPOSITORY" --clobber \
+                && gh release upload agg-latest "agg-$p.json" --repo "$GITHUB_REPOSITORY" --clobber )
+            rm -f "$SNAP"/agg-"$p".*
+            df -h / | tail -1
+          done
+          gh release edit agg-latest --repo "$GITHUB_REPOSITORY" \
+            --notes "최근 재집계: ${GITHUB_SHA} ($(date -u +%Y-%m-%dT%H:%M)Z). 인스턴스 수신: deploy/instance/fetch-agg-snapshot.sh"
+
       - name: 사이트 캐시 무효화 (선택)
         env:
           SITE_URL: ${{ vars.SITE_URL }}
