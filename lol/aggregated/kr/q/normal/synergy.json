@@ -1,0 +1,1 @@
+{"updatedAt":"2026-08-24T13:51:51.434Z","minGames":5,"modelVersion":"syn-v2","model":{"version":"syn-v2","prior":8,"perfPrior":4,"perfSigma":0.6,"weights":{"result":0.55,"perf":0.3,"champ":0.15},"couplingFloor":0.5,"scale":2},"duos":[]}
