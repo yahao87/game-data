@@ -15,8 +15,11 @@
 name: collect-lol
 
 on:
-  # 워크플로 파일 수정 푸시 시 즉시 실행 (수정 직후 바로 검증)
+  # 워크플로 파일 수정 푸시 시 즉시 실행 (수정 직후 바로 검증).
+  # main만 — 브랜치 제한이 없던 동안 작업 브랜치 push가 run을 만들어 concurrency
+  # 대기열에서 정기 수집을 밀어냈다 (2026-08-24 run #310이 #311을 취소시킨 실사고).
   push:
+    branches: [main]
     paths:
       - ".github/workflows/collect-lol.yml"
   schedule:
