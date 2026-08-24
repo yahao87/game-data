@@ -12,6 +12,11 @@
 #
 # 전체 재집계는 여기 없다 — rebuild-lol.yml을 Actions 탭에서 단건 실행한다.
 # (변수로 켜는 방식은 "켠 채로 남는다"는 문제가 구조적이라 폐기했다. 이력은 그 파일 주석 참고)
+#
+# ④-컷오버 이후: 이 워크플로는 **원장(lol/collected)만** 커밋한다. 집계는 서빙
+# 인스턴스가 로컬 SQLite에 직접 하고(sync-data.sh 10분 주기), 학습 팩은 여기서
+# model-latest 릴리스 자산으로 발행한다(인스턴스가 sha256 대조 후 수신). 파생
+# 산출물이 git을 떠나면서 커밋당 수백 MB씩 불리던 재작성 churn이 구조적으로 사라진다.
 name: collect-lol
 
 on:
@@ -149,7 +154,7 @@ jobs:
       # [수집 → 집계 → 커밋]을 라운드로 반복 — 크롤은 레이트리밋 한도에서 연속으로 돌고,
       # 데이터는 라운드마다(~20분 간격) 커밋되어 사이트에 계속 반영된다.
       # cron 주기는 "재시동 신호"일 뿐: concurrency 직렬화 + 큐잉으로 사실상 24시간 연속 크롤.
-      - name: Collect rounds (collect → aggregate → commit)
+      - name: Collect rounds (collect → commit — 집계는 인스턴스가 한다)
         working-directory: code
         env:
           RIOT_API_KEY: ${{ env.RIOT_KEY_RESOLVED }}
@@ -162,7 +167,6 @@ jobs:
           # 사용자가 실제로 여는 경기의 빌드 순서·킬 지도는 실데이터로 나온다.
           WITH_TIMELINE: ${{ inputs.with_timeline || '0' }}
           DATA_DIR: ${{ github.workspace }}/lol/collected
-          AGG_DIR: ${{ github.workspace }}/lol/aggregated
           # 수집기가 API 키 인증 실패(401/403 연속 — 개발 키 만료)로 멈추면 이 파일을 쓴다.
           # 죽은 키로 남은 라운드를 돌려 봐야 레이트리밋 속도로 실패만 반복하므로,
           # 마커를 본 라운드 루프는 진행분 정리까지만 하고 끝낸다.
@@ -187,10 +191,7 @@ jobs:
               git -C "$W" merge --abort || true
               return 1
             fi
-            pnpm --filter @game-total/lol aggregate
-            git -C "$W" add lol/
-            git -C "$W" diff --cached --quiet || \
-              git -C "$W" commit -m "lol: 경합 해소 후 재집계 $(date -u +%Y-%m-%dT%H:%M)"
+            # 컷오버 후 원장은 union 병합만으로 완결된다 — 재집계할 파생 산출물이 git에 없다
           }
 
           push_with_retry() {
@@ -212,8 +213,7 @@ jobs:
           for i in $(seq 1 "$ROUNDS"); do
             echo "── 라운드 $i/$ROUNDS ──"
             pnpm --filter @game-total/lol collect
-            pnpm --filter @game-total/lol aggregate
-            git -C "$W" add lol/
+            git -C "$W" add lol/collected
             if git -C "$W" diff --cached --quiet; then
               [ -f "$COLLECT_STOP_FILE" ] && warn_auth_stop
               echo "변경 없음 — 라운드 종료"
@@ -287,74 +287,107 @@ jobs:
       # 수집은 이미 커밋·푸시를 마친 뒤라, 학습 실패로 실행 전체를 빨갛게 만들지 않는다.
       # 키 만료로 수집이 일찍 멈춘 실행에서도 학습은 그대로 돈다 — 학습은 로컬 원장만
       # 읽고 Riot API를 부르지 않으므로, 이미 커밋된 데이터로 팩을 최신화하는 게 맞다.
-      - name: Train models (팩이 낡았을 때만)
+      - name: Train models (팩이 낡았을 때만 → model-latest 릴리스로 발행)
         working-directory: code
         continue-on-error: true
         env:
+          GH_TOKEN: ${{ github.token }}
           PLATFORM: ${{ inputs.platform || 'kr' }}
           TRAIN_MAX_MATCHES: "200000"
           DRAFT_MAX_MATCHES: "200000"
           EVERY_HOURS: ${{ vars.TRAIN_EVERY_HOURS || '6' }}
           DATA_DIR: ${{ github.workspace }}/lol/collected
-          AGG_DIR: ${{ github.workspace }}/lol/aggregated
+          # 컷오버 후 팩은 git이 아니라 릴리스 자산이다. 학습 출력은 러너 임시 경로에 두고
+          # 매니페스트(models.json: rel·sha256·generatedAt)와 함께 model-latest에 올린다.
+          # 인스턴스는 sync-data.sh가 매니페스트를 받아 sha256 대조 후 DB에 반영한다
+          # (game-total deploy/instance + tools/apply-model-packs.cjs).
+          AGG_DIR: ${{ runner.temp }}/train-agg
           NODE_OPTIONS: --max-old-space-size=6144
         run: |
           set -eu
-          W="$GITHUB_WORKSPACE"
-          MODELS="$W/lol/aggregated/$PLATFORM/models"
+          MODELS="$AGG_DIR/$PLATFORM/models"
+          mkdir -p "$MODELS"
+          RELEASE=model-latest
+          BASE="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE"
 
-          # 팩 나이(시간)를 팩 안의 generatedAt에서 읽는다. 없거나 못 읽으면 아주 낡은 걸로 본다.
+          # 팩 나이(시간) — 릴리스 매니페스트의 팩별 generatedAt에서 읽는다.
+          # 릴리스·매니페스트·항목이 없으면 아주 낡은 것으로 본다(첫 실행 = 학습).
+          manifest=$(curl -sfL "$BASE/models.json" 2>/dev/null || echo "{}")
           pack_age() {
-            [ -f "$1" ] || { echo 999999; return; }
-            node -e '
-              const fs = require("fs");
-              try {
-                const g = JSON.parse(fs.readFileSync(process.argv[1], "utf8")).generatedAt;
-                const h = Math.floor((Date.now() - Date.parse(g)) / 3600000);
-                console.log(Number.isFinite(h) && h >= 0 ? h : 999999);
-              } catch { console.log(999999); }
+            echo "$manifest" | node -e '
+              const rel = process.argv[1];
+              let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
+                try {
+                  const m = JSON.parse(s);
+                  const g = (m.packs ?? []).find((p) => p.rel === rel)?.generatedAt;
+                  const h = Math.floor((Date.now() - Date.parse(g)) / 3600000);
+                  console.log(Number.isFinite(h) && h >= 0 ? h : 999999);
+                } catch { console.log(999999); }
+              });
             ' "$1"
           }
 
-          # 두 학습은 표본 정의가 달라 서로 다른 스크립트다.
-          #   train.ts       10명 전원의 이력이 필요 — 7만 경기가 5천 표본으로 줄어든다
-          #   train-draft.ts 챔피언·라인·결과만 — 같은 원장에서 14만 표본이 나온다
-          # 나이는 각자의 팩으로 따로 잰다. 한쪽이 실패해도 다른 쪽은 갱신돼야 한다.
+          # 두 학습은 표본 정의가 달라 서로 다른 스크립트다 (컷오버 전과 동일한 이유).
+          trained=0
           run_if_stale() {
-            NAME="$1"; PACK="$2"; SCRIPT="$3"
-            AGE=$(pack_age "$PACK")
+            NAME="$1"; REL="$2"; SCRIPT="$3"
+            AGE=$(pack_age "$REL")
             if [ "$AGE" -lt "$EVERY_HOURS" ]; then
               echo "[$NAME] 팩이 ${AGE}시간 전 것 — ${EVERY_HOURS}시간 주기라 건너뛴다"
               return 0
             fi
             echo "[$NAME] 팩 나이 ${AGE}시간 — 재학습한다"
-            # 한쪽 학습이 죽어도 나머지와 커밋 단계는 진행한다
-            pnpm --filter @game-total/lol exec tsx "$SCRIPT" || echo "::warning::[$NAME] 학습 실패 — 다음 주기에 다시 시도"
+            if pnpm --filter @game-total/lol exec tsx "$SCRIPT"; then trained=1; else
+              echo "::warning::[$NAME] 학습 실패 — 다음 주기에 다시 시도"
+            fi
           }
 
-          run_if_stale "패밀리" "$MODELS/family-v1.json" scripts/train.ts
-          run_if_stale "밴픽"   "$MODELS/draft-v1.json"  scripts/train-draft.ts
+          run_if_stale "패밀리" "models/family-v1.json" scripts/train.ts
+          run_if_stale "밴픽"   "models/draft-v1.json"  scripts/train-draft.ts
 
-          git -C "$W" add lol/
-          if git -C "$W" diff --cached --quiet; then
-            echo "변경 없음 (전부 건너뛰었거나 표본 부족이거나 동일 산출물)"
+          if [ "$trained" = 0 ]; then
+            echo "발행할 새 팩 없음"
             exit 0
           fi
-          git -C "$W" commit -m "lol: 모델 학습 $(date -u +%Y-%m-%dT%H:%M)"
-          # 학습 산출물은 models/ 아래만 건드리므로, 경합 시 원격을 우선 채택해 병합해도
-          # 우리 커밋의 models/ 변경은 그대로 남는다.
-          for attempt in 1 2 3 4 5; do
-            if git -C "$W" push; then exit 0; fi
-            echo "푸시 경합 — 병합 후 재시도 ($attempt/5)"
-            git -C "$W" fetch origin "$GITHUB_REF_NAME"
-            git -C "$W" merge --no-edit -X ours "origin/$GITHUB_REF_NAME" || {
-              echo "::warning::자동 병합 실패 — 다음 주기에 다시 시도"
-              git -C "$W" merge --abort || true
-              exit 0
+
+          # 매니페스트 + 자산 발행. 자산명은 rel의 "/"를 "-"로 (릴리스 자산은 경로 불가).
+          # 매니페스트는 마지막에 올린다 — 자산이 다 올라간 뒤라야 수신 쪽 sha 대조가 성립한다.
+          if ! gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE" --repo "$GITHUB_REPOSITORY" \
+              --title "학습 팩 (자동 갱신)" \
+              --notes "collect-lol의 train 스텝이 갱신하는 고정 릴리스. 인스턴스 수신: sync-data.sh." \
+              --latest=false
+          fi
+          node -e '
+            const fs = require("fs"), path = require("path"), crypto = require("crypto");
+            const dir = process.argv[1];
+            const packs = [];
+            for (const f of fs.readdirSync(dir).sort()) {
+              if (!f.endsWith(".json")) continue;
+              const body = fs.readFileSync(path.join(dir, f));
+              let generatedAt = null;
+              try { generatedAt = JSON.parse(body.toString()).generatedAt ?? null; } catch {}
+              packs.push({
+                rel: `models/${f}`,
+                sha256: crypto.createHash("sha256").update(body).digest("hex"),
+                bytes: body.length,
+                generatedAt,
+              });
             }
-            sleep $((attempt * 3))
+            fs.writeFileSync(path.join(dir, "models.manifest"), JSON.stringify({
+              generatedAt: new Date().toISOString(),
+              packs,
+            }, null, 2) + "\n");
+            console.log(`매니페스트: ${packs.length}팩`);
+          ' "$MODELS"
+          for f in "$MODELS"/*.json; do
+            name="models-$(basename "$f")"
+            cp "$f" "$RUNNER_TEMP/$name"
+            gh release upload "$RELEASE" "$RUNNER_TEMP/$name" --repo "$GITHUB_REPOSITORY" --clobber
           done
-          echo "::warning::학습 산출물 푸시 실패 — 다음 주기에 다시 시도한다"
+          cp "$MODELS/models.manifest" "$RUNNER_TEMP/models.json"
+          gh release upload "$RELEASE" "$RUNNER_TEMP/models.json" --repo "$GITHUB_REPOSITORY" --clobber
+          echo "발행 완료 — $BASE/models.json"
 
       # 흡수 마커 정리. HTTP 펜딩(인스턴스)에서는 원격 삭제가 no-op이라 마커만 지우고,
       # 단일 레포 폴백(LOL_PENDING_DIR)에서는 push 성공 후의 실삭제다 (실패 시 다음

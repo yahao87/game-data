@@ -149,6 +149,9 @@ jobs:
             ' "$A/$p" "$p" "$RUNNER_TEMP/rebuild-start"
           done
 
+      # ④-컷오버 이후 aggregated는 .gitignore라 일반 경로에서는 커밋될 것이 없다 —
+      # 이 스텝의 실질 용도는 prune_history=true(원장만 남기는 이력 정리)뿐이다.
+      # 재집계 산출물의 배포는 위의 스냅샷 발행(agg-latest)이 담당한다.
       - name: 커밋 · 푸시
         env:
           PRUNE: ${{ inputs.prune_history }}

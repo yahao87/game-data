@@ -1,6 +1,4 @@
-# 워크플로 실행 중에만 존재하는 코드 저장소 체크아웃
-code/
-.pending-absorbed.json
-node_modules/
-*.log
-.DS_Store
+# 파생 산출물은 git을 떠났다 (④-컷오버) — 집계는 인스턴스 로컬 SQLite에서,
+# 전체 재집계 산출물은 agg-latest 릴리스 스냅샷으로, 학습 팩은 model-latest 릴리스로.
+# 원장(lol/collected)만이 git의 진실이다.
+lol/aggregated/
