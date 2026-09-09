@@ -1,7 +1,7 @@
 {
   "platform": "kr",
-  "totalMatches": 363185,
-  "playerRecords": 10600,
+  "totalMatches": 363985,
+  "playerRecords": 10613,
   "shards": {
     "2024-09": 1,
     "2024-10": 2,
@@ -29,5 +29,5 @@
     "2026-08": 195,
     "2026-09": 19
   },
-  "updatedAt": "2026-09-08T23:33:13.190Z"
+  "updatedAt": "2026-09-09T00:43:28.028Z"
 }
